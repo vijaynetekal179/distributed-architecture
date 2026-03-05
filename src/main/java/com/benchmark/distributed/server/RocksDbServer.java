@@ -113,11 +113,25 @@ public class RocksDbServer {
     }
 
     private static Options buildOptions() {
+        int cpuCores = Runtime.getRuntime().availableProcessors();
+        System.out.println("[RocksDB] Detected " + cpuCores + " CPU cores. Enabling full C++ parallelism...");
+
         Options options = new Options();
-        // Enable maximum internal C++ parallelism for flushes/compactions
-        options.setIncreaseParallelism(Runtime.getRuntime().availableProcessors());
+
+        // LAYER 1: Spin up OS-level C++ thread pools inside RocksDB
+        // Source: options.cc line 694 - sets env->SetBackgroundThreads(n, LOW/HIGH)
+        options.setIncreaseParallelism(cpuCores);
+
+        // LAYER 2: Allow a single compaction job to split into parallel sub-tasks
+        // Source: options.h line 924 - default is 1 (no sub-compactions!)
+        options.setMaxSubcompactions(cpuCores);
+
+        // LAYER 3: Tune write buffers and compaction style for write-heavy workloads
+        options.optimizeLevelStyleCompaction();
+
         options.setCreateIfMissing(true);
-        options.setMaxBackgroundJobs(8);
+        // Match background job count to CPU core count (previously hardcoded to 8)
+        options.setMaxBackgroundJobs(cpuCores);
         options.setWriteBufferSize(64 * 1024 * 1024);
         options.setMaxWriteBufferNumber(4);
         options.setLevel0FileNumCompactionTrigger(4);
