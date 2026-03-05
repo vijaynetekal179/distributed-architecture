@@ -3,48 +3,52 @@ package com.benchmark.distributed.client;
 import com.benchmark.distributed.grpc.*;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
+import io.grpc.stub.StreamObserver;
 
-import java.util.concurrent.*;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Laptop 1: Benchmark Client (i3-1115G4, 4GB RAM)
- * Generates load and tracks latencies.
+ * Generates load using High-Performance Asynchronous Streaming over a Network.
  */
 public class BenchmarkClient {
     private static String apiProxyHost = "192.168.0.211";
     private static final int API_PROXY_PORT = 50051;
 
-    // Laptop 1 Tuning: It only has an i3 and 4GB RAM.
-    // If we use too many threads, it will crash. 64 concurrent streams is safe but
-    // high enough to generate good load.
-    private static final int NUM_THREADS = 64;
-    private static final int NUM_OPERATIONS = 500_000; // Moderate target batch
+    private static final int NUM_OPERATIONS = 1_000_000; // Increased to 1 Million items for stress-test!
+    // Laptop 1 has 4GB RAM. We cannot push 1 million requests into memory at the
+    // exact same moment.
+    // We will throttle "In-Flight" network requests to a maximum of 15,000 parallel
+    // streams.
+    private static final int MAX_CONCURRENT_REQUESTS = 15000;
 
     public static void main(String[] args) throws InterruptedException {
-        // Pass Proxy API IP via: java -jar app.jar <API_IP>
         if (args.length > 0) {
             apiProxyHost = args[0];
         } else {
-            System.out.println("⚠️ No API Proxy IP provided. Defaulting to localhost.");
+            System.out.println("⚠️ No API Proxy IP provided. Defaulting to: " + apiProxyHost);
         }
 
-        System.out.println("🚀 Starting Client Load Generator (Laptop 1)");
+        System.out.println("🚀 Starting (ASYNC) Client Load Generator (Laptop 1)");
         System.out.println("- Target: " + apiProxyHost + ":" + API_PROXY_PORT);
-        System.out.println("- Threads: " + NUM_THREADS);
+        System.out.println("- Max In-Flight Streams: " + MAX_CONCURRENT_REQUESTS);
         System.out.println("- Total Operations: " + NUM_OPERATIONS);
 
         ManagedChannel channel = ManagedChannelBuilder.forAddress(apiProxyHost, API_PROXY_PORT)
                 .usePlaintext()
-                // Tuning for high throughput connection
+                // Networking tuning for sending mass amounts of data seamlessly
                 .maxInboundMessageSize(100 * 1024 * 1024)
                 .build();
 
-        // Use blocking stub for the thread-pool executor model
-        ApiServiceGrpc.ApiServiceBlockingStub blockingStub = ApiServiceGrpc.newBlockingStub(channel);
+        // **OPTIMIZATION 1:** Switch to non-blocking Asynchronous Stub
+        ApiServiceGrpc.ApiServiceStub asyncStub = ApiServiceGrpc.newStub(channel);
 
-        ExecutorService executor = Executors.newFixedThreadPool(NUM_THREADS);
+        // Control the number of parallel network requests so we don't blow up Laptop
+        // 1's JVM
+        Semaphore inFlightPermits = new Semaphore(MAX_CONCURRENT_REQUESTS);
         CountDownLatch latch = new CountDownLatch(NUM_OPERATIONS);
 
         AtomicLong totalLatencyNs = new AtomicLong(0);
@@ -53,37 +57,54 @@ public class BenchmarkClient {
 
         long startTime = System.currentTimeMillis();
 
-        for (int i = 0; i < NUM_OPERATIONS; i++) {
-            final int index = i;
-            executor.submit(() -> {
-                long opStart = System.nanoTime();
-                try {
-                    PutRequest request = PutRequest.newBuilder()
-                            .setKey("key" + index)
-                            .setValue("value" + index + "_payload_data_padding_to_simulate_real_load_1234567890")
-                            .build();
+        // **OPTIMIZATION 2:** Use a single aggressive loop instead of ThreadPool
+        // We just dispatch tasks over the network instantly!
+        System.out.println("\n🔥 Pumping " + NUM_OPERATIONS + " Async streams across the network...");
 
-                    PutResponse response = blockingStub.putRecord(request);
+        for (int i = 0; i < NUM_OPERATIONS; i++) {
+            // Wait for permission if we have hit the 15,000 threshold
+            inFlightPermits.acquire();
+
+            final int index = i;
+            long opStart = System.nanoTime();
+
+            PutRequest request = PutRequest.newBuilder()
+                    .setKey("key" + index)
+                    .setValue("value" + index + "_payload_data_padding_to_simulate_real_load_1234567890")
+                    .build();
+
+            // Fire-and-forget over the network
+            asyncStub.putRecord(request, new StreamObserver<PutResponse>() {
+                @Override
+                public void onNext(PutResponse response) {
                     if (response.getSuccess()) {
                         successCount.incrementAndGet();
                     } else {
                         failCount.incrementAndGet();
                     }
-                    long opEnd = System.nanoTime();
-                    totalLatencyNs.addAndGet(opEnd - opStart);
-                } catch (Exception e) {
+                }
+
+                @Override
+                public void onError(Throwable t) {
                     failCount.incrementAndGet();
-                } finally {
                     latch.countDown();
+                    inFlightPermits.release();
+                    totalLatencyNs.addAndGet(System.nanoTime() - opStart);
+                }
+
+                @Override
+                public void onCompleted() {
+                    latch.countDown();
+                    inFlightPermits.release(); // Freed a network slot, let another one run!
+                    totalLatencyNs.addAndGet(System.nanoTime() - opStart);
                 }
             });
         }
 
-        System.out.println("⏳ Waiting for " + NUM_OPERATIONS + " operations to complete...");
+        System.out.println("⏳ Waiting for " + NUM_OPERATIONS + " operations to return from Laptop 3...");
         latch.await();
         long endTime = System.currentTimeMillis();
 
-        executor.shutdown();
         channel.shutdown();
 
         // Calculate and Print Metrics
@@ -92,7 +113,7 @@ public class BenchmarkClient {
         double tps = NUM_OPERATIONS / durationSec;
         double avgLatencyMs = (totalLatencyNs.get() / (double) NUM_OPERATIONS) / 1_000_000.0;
 
-        System.out.println("\n📊 --- BENCHMARK RESULTS ---");
+        System.out.println("\n📊 --- DISTRIBUTED BENCHMARK RESULTS ---");
         System.out.println("Total Time: " + durationSec + " seconds");
         System.out.println("Total Operations: " + NUM_OPERATIONS);
         System.out.println("Successful Ops: " + successCount.get());
@@ -102,6 +123,6 @@ public class BenchmarkClient {
         System.out.printf("⏱️ Average Latency: %.2f ms/op\n", avgLatencyMs);
         System.out.println("----------------------------------");
         System.out.println(
-                "\nNote: This is end-to-end latency including Machine 1 -> Machine 2 -> Machine 3 network hops.");
+                "\nNote: End-To-End Latency = Laptop 1 -> Laptop 2 -> Laptop 3 -> SSD -> Laptop 2 -> Laptop 1");
     }
 }

@@ -7,6 +7,7 @@ import io.grpc.stub.StreamObserver;
 import org.rocksdb.Options;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
+import org.rocksdb.WriteOptions;
 
 import java.io.File;
 import java.io.IOException;
@@ -84,15 +85,19 @@ public class RocksDbServer {
     // High-performance direct RocksDB service
     static class DatabaseServiceImpl extends DatabaseServiceGrpc.DatabaseServiceImplBase {
         private final RocksDB db;
+        // OPTIMIZATION: Disable WAL to prevent waiting on SSD syncs over the network
+        private final WriteOptions writeOptions;
 
         DatabaseServiceImpl(RocksDB db) {
             this.db = db;
+            this.writeOptions = new WriteOptions().setDisableWAL(true);
         }
 
         @Override
         public void putRecord(PutRequest req, StreamObserver<PutResponse> responseObserver) {
             try {
-                db.put(req.getKey().getBytes(), req.getValue().getBytes());
+                // OPTIMIZATION: Use the write options with WAL disabled
+                db.put(writeOptions, req.getKey().getBytes(), req.getValue().getBytes());
                 PutResponse reply = PutResponse.newBuilder().setSuccess(true).build();
                 responseObserver.onNext(reply);
                 responseObserver.onCompleted();
