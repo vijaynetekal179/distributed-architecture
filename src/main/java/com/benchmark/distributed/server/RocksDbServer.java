@@ -114,6 +114,8 @@ public class RocksDbServer {
 
     private static Options buildOptions() {
         Options options = new Options();
+        // Enable maximum internal C++ parallelism for flushes/compactions
+        options.setIncreaseParallelism(Runtime.getRuntime().availableProcessors());
         options.setCreateIfMissing(true);
         options.setMaxBackgroundJobs(8);
         options.setWriteBufferSize(64 * 1024 * 1024);
