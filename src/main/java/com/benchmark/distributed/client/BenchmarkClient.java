@@ -1,128 +1,275 @@
 package com.benchmark.distributed.client;
 
 import com.benchmark.distributed.grpc.*;
-import io.grpc.ManagedChannel;
-import io.grpc.ManagedChannelBuilder;
+import io.grpc.*;
+import io.grpc.netty.shaded.io.grpc.netty.GrpcSslContexts;
+import io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder;
+import io.grpc.netty.shaded.io.netty.handler.ssl.SslContext;
+import io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder;
+import io.grpc.stub.ClientCallStreamObserver;
+import io.grpc.stub.MetadataUtils;
 import io.grpc.stub.StreamObserver;
 
+import javax.net.ssl.TrustManagerFactory;
+import java.io.FileInputStream;
+import java.security.KeyStore;
+import java.security.cert.Certificate;
+import java.security.cert.CertificateFactory;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Random;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.Semaphore;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Laptop 1: Benchmark Client (i3-1115G4, 4GB RAM)
- * Generates load using High-Performance Asynchronous Streaming over a Network.
+ * Laptop 1: Benchmark Client
+ * Restored the 96 thread / 200 batch Operations network bomber mechanism!
  */
 public class BenchmarkClient {
     private static String apiProxyHost = "192.168.0.211";
     private static final int API_PROXY_PORT = 50051;
 
-    private static final int NUM_OPERATIONS = 1_000_000; // Increased to 1 Million items for stress-test!
-    // Laptop 1 has 4GB RAM. We cannot push 1 million requests into memory at the
-    // exact same moment.
-    // We will throttle "In-Flight" network requests to a maximum of 15,000 parallel
-    // streams.
-    private static final int MAX_CONCURRENT_REQUESTS = 15000;
+    private static final int TOTAL_USERS = 1_000_000;
+    private static final int BATCH_SIZE = 200;
+    // Massive thread load matches the single machine architecture test
+    private static final int THREADS = 96;
 
-    public static void main(String[] args) throws InterruptedException {
-        if (args.length > 0) {
+    // Metadata key matching the server interceptor
+    private static final Metadata.Key<String> AUTH_HEADER = Metadata.Key.of("authorization",
+            Metadata.ASCII_STRING_MARSHALLER);
+
+    public static void main(String[] args) throws Exception {
+        if (args.length > 0)
             apiProxyHost = args[0];
-        } else {
-            System.out.println("⚠️ No API Proxy IP provided. Defaulting to: " + apiProxyHost);
+
+        System.out.println("Starting Secure gRPC Benchmark Client (Laptop 1)");
+        System.out.println("- Target: " + apiProxyHost + ":" + API_PROXY_PORT);
+
+        // --- PROPER TLS: Load sever cert ---
+        CertificateFactory cf = CertificateFactory.getInstance("X.509");
+        Certificate serverCert;
+        try (FileInputStream fis = new FileInputStream("benchmark.crt")) {
+            serverCert = cf.generateCertificate(fis);
         }
 
-        System.out.println("🚀 Starting (ASYNC) Client Load Generator (Laptop 1)");
-        System.out.println("- Target: " + apiProxyHost + ":" + API_PROXY_PORT);
-        System.out.println("- Max In-Flight Streams: " + MAX_CONCURRENT_REQUESTS);
-        System.out.println("- Total Operations: " + NUM_OPERATIONS);
+        KeyStore trustStore = KeyStore.getInstance(KeyStore.getDefaultType());
+        trustStore.load(null, null);
+        trustStore.setCertificateEntry("benchmark-server", serverCert);
 
-        ManagedChannel channel = ManagedChannelBuilder.forAddress(apiProxyHost, API_PROXY_PORT)
-                .usePlaintext()
-                // Networking tuning for sending mass amounts of data seamlessly
-                .maxInboundMessageSize(100 * 1024 * 1024)
+        TrustManagerFactory tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+        tmf.init(trustStore);
+
+        SslContext sslContext = GrpcSslContexts.configure(SslContextBuilder.forClient().trustManager(tmf)).build();
+
+        ManagedChannel channel = NettyChannelBuilder.forAddress(apiProxyHost, API_PROXY_PORT)
+                .sslContext(sslContext)
+                .overrideAuthority("localhost")
                 .build();
 
-        // **OPTIMIZATION 1:** Switch to non-blocking Asynchronous Stub
-        ApiServiceGrpc.ApiServiceStub asyncStub = ApiServiceGrpc.newStub(channel);
+        ApiServiceGrpc.ApiServiceBlockingStub blockingStub = ApiServiceGrpc.newBlockingStub(channel);
 
-        // Control the number of parallel network requests so we don't blow up Laptop
-        // 1's JVM
-        Semaphore inFlightPermits = new Semaphore(MAX_CONCURRENT_REQUESTS);
-        CountDownLatch latch = new CountDownLatch(NUM_OPERATIONS);
+        // --- AUTHENTICATION HANDSHAKE WITH API PROXY ---
+        AuthResponse authResponse = blockingStub.authenticate(
+                AuthRequest.newBuilder().setPassword("SuperSecretPassword123!").build());
 
-        AtomicLong totalLatencyNs = new AtomicLong(0);
-        AtomicInteger successCount = new AtomicInteger(0);
-        AtomicInteger failCount = new AtomicInteger(0);
-
-        long startTime = System.currentTimeMillis();
-
-        // **OPTIMIZATION 2:** Use a single aggressive loop instead of ThreadPool
-        // We just dispatch tasks over the network instantly!
-        System.out.println("\n🔥 Pumping " + NUM_OPERATIONS + " Async streams across the network...");
-
-        for (int i = 0; i < NUM_OPERATIONS; i++) {
-            // Wait for permission if we have hit the 15,000 threshold
-            inFlightPermits.acquire();
-
-            final int index = i;
-            long opStart = System.nanoTime();
-
-            PutRequest request = PutRequest.newBuilder()
-                    .setKey("key" + index)
-                    .setValue("value" + index + "_payload_data_padding_to_simulate_real_load_1234567890")
-                    .build();
-
-            // Fire-and-forget over the network
-            asyncStub.putRecord(request, new StreamObserver<PutResponse>() {
-                @Override
-                public void onNext(PutResponse response) {
-                    if (response.getSuccess()) {
-                        successCount.incrementAndGet();
-                    } else {
-                        failCount.incrementAndGet();
-                    }
-                }
-
-                @Override
-                public void onError(Throwable t) {
-                    failCount.incrementAndGet();
-                    latch.countDown();
-                    inFlightPermits.release();
-                    totalLatencyNs.addAndGet(System.nanoTime() - opStart);
-                }
-
-                @Override
-                public void onCompleted() {
-                    latch.countDown();
-                    inFlightPermits.release(); // Freed a network slot, let another one run!
-                    totalLatencyNs.addAndGet(System.nanoTime() - opStart);
-                }
-            });
+        if (!authResponse.getSuccess()) {
+            System.err.println("Failed to authenticate to API Proxy Server.");
+            channel.shutdown();
+            return;
         }
 
-        System.out.println("⏳ Waiting for " + NUM_OPERATIONS + " operations to return from Laptop 3...");
+        String jwtToken = authResponse.getToken();
+        System.out.println("Authenticated successfully. JWT token received.");
+
+        // Attach JWT to all subsequent calls via metadata interceptor
+        Metadata authMetadata = new Metadata();
+        authMetadata.put(AUTH_HEADER, "Bearer " + jwtToken);
+        ApiServiceGrpc.ApiServiceStub asyncStub = ApiServiceGrpc.newStub(channel)
+                .withInterceptors(MetadataUtils.newAttachHeadersInterceptor(authMetadata));
+
+        // --- PHASE 1: Serial Latency Test ---
+        double[] latencyStats = runSerialLatencyTest(asyncStub);
+
+        // --- PHASE 2: Throughput Benchmark ---
+        CountDownLatch latch = new CountDownLatch(THREADS);
+        AtomicLong totalBatches = new AtomicLong(0);
+        AtomicLong successfulOps = new AtomicLong(0);
+        AtomicLong failedOps = new AtomicLong(0);
+
+        long globalStartTime = System.currentTimeMillis();
+        AtomicBoolean isRunning = new AtomicBoolean(true);
+
+        System.out.println("\n🔥 Pumping huge batches identically to original script...");
+
+        for (int t = 0; t < THREADS; t++) {
+            new Thread(() -> {
+                try {
+                    CountDownLatch streamLatch = new CountDownLatch(1);
+
+                    StreamObserver<OperationBatch> requestObserver = asyncStub.streamOperations(
+                            new StreamObserver<BatchResult>() {
+                                @Override
+                                public void onNext(BatchResult value) {
+                                    totalBatches.incrementAndGet();
+                                    if (value.getSuccess()) {
+                                        successfulOps.addAndGet(BATCH_SIZE);
+                                    } else {
+                                        failedOps.addAndGet(BATCH_SIZE);
+                                    }
+                                }
+
+                                @Override
+                                public void onError(Throwable tr) {
+                                    failedOps.addAndGet(BATCH_SIZE);
+                                    streamLatch.countDown();
+                                }
+
+                                @Override
+                                public void onCompleted() {
+                                    streamLatch.countDown();
+                                }
+                            });
+
+                    Random rand = new Random();
+                    while (isRunning.get()) {
+                        OperationBatch.Builder batchBuilder = OperationBatch.newBuilder();
+                        for (int b = 0; b < BATCH_SIZE; b++) {
+                            int userId = rand.nextInt(TOTAL_USERS);
+                            int chance = rand.nextInt(100);
+                            Operation.OpType type = (chance < 50) ? Operation.OpType.READ
+                                    : (chance < 80) ? Operation.OpType.UPDATE : Operation.OpType.DELETE;
+                            batchBuilder.addOperations(Operation.newBuilder().setUserId(userId).setType(type).build());
+                        }
+
+                        requestObserver.onNext(batchBuilder.build());
+
+                        // Smart gRPC Flow Control to avoid choking network link
+                        ClientCallStreamObserver<OperationBatch> callObserver = (ClientCallStreamObserver<OperationBatch>) requestObserver;
+                        while (isRunning.get() && !callObserver.isReady()) {
+                            try {
+                                Thread.sleep(1);
+                            } catch (InterruptedException e) {
+                                break;
+                            }
+                        }
+                    }
+
+                    requestObserver.onCompleted();
+                    streamLatch.await(1, TimeUnit.MINUTES);
+                } catch (Exception e) {
+                    e.printStackTrace();
+                } finally {
+                    latch.countDown();
+                }
+            }).start();
+        }
+
+        // Let the benchmark run for 1 minute
+        Thread.sleep(60000);
+        isRunning.set(false);
+
         latch.await();
-        long endTime = System.currentTimeMillis();
+        long globalEndTime = System.currentTimeMillis();
+        channel.shutdown().awaitTermination(5, TimeUnit.SECONDS);
 
-        channel.shutdown();
+        long totalOps = successfulOps.get() + failedOps.get();
+        printResults(globalStartTime, globalEndTime, totalOps, successfulOps.get(), failedOps.get(), totalBatches.get(),
+                latencyStats);
+    }
 
-        // Calculate and Print Metrics
-        long durationMs = endTime - startTime;
+    private static void printResults(long startMs, long endMs, long totalOps, long successfulOps, long failedOps,
+            long totalBatches, double[] lat) {
+        long durationMs = endMs - startMs;
         double durationSec = durationMs / 1000.0;
-        double tps = NUM_OPERATIONS / durationSec;
-        double avgLatencyMs = (totalLatencyNs.get() / (double) NUM_OPERATIONS) / 1_000_000.0;
+        long tps = (long) (successfulOps / durationSec);
 
-        System.out.println("\n📊 --- DISTRIBUTED BENCHMARK RESULTS ---");
-        System.out.println("Total Time: " + durationSec + " seconds");
-        System.out.println("Total Operations: " + NUM_OPERATIONS);
-        System.out.println("Successful Ops: " + successCount.get());
-        System.out.println("Failed Ops: " + failCount.get());
-        System.out.println("----------------------------------");
-        System.out.printf("⭐ Throughput (TPS): %.2f ops/sec\n", tps);
-        System.out.printf("⏱️ Average Latency: %.2f ms/op\n", avgLatencyMs);
-        System.out.println("----------------------------------");
-        System.out.println(
-                "\nNote: End-To-End Latency = Laptop 1 -> Laptop 2 -> Laptop 3 -> SSD -> Laptop 2 -> Laptop 1");
+        double avgBatchLatencyMs = totalBatches > 0 ? (double) durationMs / totalBatches : 0.0;
+
+        System.out.println("\n==================================================");
+        System.out.println(" ROCKSDB DISTRIBUTED BENCHMARK (TLS & PROXY) ");
+        System.out.println("==================================================");
+        System.out.println("Batch Size     : " + BATCH_SIZE + " ops/batch");
+        System.out.println("Threads        : " + THREADS);
+        System.out.println("----- Throughput --------------------------------");
+        System.out.println("Total Ops      : " + totalOps);
+        System.out.println("Success Ops    : " + successfulOps);
+        System.out.println("TPS            : " + tps + " ops/sec");
+        System.out.printf("Throughput Lat : %.4f ms/batch %n", avgBatchLatencyMs);
+        System.out.println("----- Per-Op Latency (serial, 1000 samples) ----");
+        System.out.printf("  Min          : %.4f ms%n", lat[0]);
+        System.out.printf("  Avg          : %.4f ms%n", lat[1]);
+        System.out.printf("  P50 (median) : %.4f ms%n", lat[2]);
+        System.out.printf("  P95          : %.4f ms%n", lat[3]);
+        System.out.printf("  P99          : %.4f ms%n", lat[4]);
+        System.out.println("==================================================");
+    }
+
+    private static double[] runSerialLatencyTest(ApiServiceGrpc.ApiServiceStub asyncStub) throws InterruptedException {
+        final int WARMUP_SAMPLES = 100;
+        final int MEASURE_SAMPLES = 1000;
+        final int TOTAL_SAMPLES = WARMUP_SAMPLES + MEASURE_SAMPLES;
+
+        List<Long> latenciesNs = new ArrayList<>(MEASURE_SAMPLES);
+        Random rand = new Random();
+
+        CountDownLatch streamDone = new CountDownLatch(1);
+        StreamObserver<OperationBatch>[] reqHolder = new StreamObserver[1];
+        final CountDownLatch[] responseSignal = { new CountDownLatch(1) };
+        final boolean[] measuring = { false };
+        final long[] sendTs = { 0L };
+
+        reqHolder[0] = asyncStub.streamOperations(new StreamObserver<BatchResult>() {
+            @Override
+            public void onNext(BatchResult value) {
+                if (measuring[0])
+                    latenciesNs.add(System.nanoTime() - sendTs[0]);
+                responseSignal[0].countDown();
+            }
+
+            @Override
+            public void onError(Throwable t) {
+                responseSignal[0].countDown();
+                streamDone.countDown();
+            }
+
+            @Override
+            public void onCompleted() {
+                streamDone.countDown();
+            }
+        });
+
+        for (int i = 0; i < TOTAL_SAMPLES; i++) {
+            if (i == WARMUP_SAMPLES)
+                measuring[0] = true;
+
+            int userId = rand.nextInt(TOTAL_USERS);
+            int chance = rand.nextInt(100);
+            Operation.OpType type = (chance < 50) ? Operation.OpType.READ
+                    : (chance < 80) ? Operation.OpType.UPDATE : Operation.OpType.DELETE;
+            OperationBatch batch = OperationBatch.newBuilder()
+                    .addOperations(Operation.newBuilder().setUserId(userId).setType(type).build()).build();
+
+            responseSignal[0] = new CountDownLatch(1);
+            sendTs[0] = System.nanoTime();
+            reqHolder[0].onNext(batch);
+            responseSignal[0].await(5, TimeUnit.SECONDS);
+        }
+
+        reqHolder[0].onCompleted();
+        streamDone.await(10, TimeUnit.SECONDS);
+
+        Collections.sort(latenciesNs);
+        int n = latenciesNs.size();
+        return new double[] {
+                latenciesNs.get(0) / 1_000_000.0,
+                latenciesNs.stream().mapToLong(Long::longValue).average().orElse(0) / 1_000_000.0,
+                latenciesNs.get((int) (n * 0.50)) / 1_000_000.0,
+                latenciesNs.get((int) (n * 0.95)) / 1_000_000.0,
+                latenciesNs.get((int) (n * 0.99)) / 1_000_000.0,
+                latenciesNs.get(n - 1) / 1_000_000.0
+        };
     }
 }
